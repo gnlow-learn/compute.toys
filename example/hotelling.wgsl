@@ -3,6 +3,58 @@
 // ---------------------------------------------------------
 const MAX_FIRMS: i32 = 64;
 
+// ---------------------------------------------------------
+// 1. 실시간 지가 계산 함수 (가게 밀집도 기반)
+// ---------------------------------------------------------
+fn get_dynamic_land_value(pos: vec2<f32>, exclude_id: i32) -> f32 {
+    var density = 0.0;
+    for (var i = 0; i < MAX_FIRMS; i++) {
+        if (i == exclude_id) { continue; }
+        let other = get_firm_main(i);
+        if (other.w <= 0.0) { continue; }
+        
+        let d = distance(pos, other.xy);
+        // 주변에 가게가 많을수록, 그 가게의 규모(w)가 클수록 지가가 상승
+        density += other.w * exp(-10.0 * d); 
+    }
+    // 기본 지가 0.1 + 밀집도 가중치
+    return 0.1 + clamp(density * 0.5, 0.0, 2.0);
+}
+
+// ---------------------------------------------------------
+// 2. 경제 로직 (동적 지가 반영)
+// ---------------------------------------------------------
+fn calc_net_profit(test_pos: vec2<f32>, test_price: f32, firm_id: i32) -> f32 {
+    let transport = 2.2;
+    var revenue = 0.0;
+    
+    // 1. 매출 계산 (기존과 동일하되 주변 수요 시뮬레이션)
+    for (var y = 0.1; y < 1.0; y += 0.2) {
+        for (var x = 0.1; x < 1.0; x += 0.2) {
+            let p = vec2<f32>(x, y);
+            let my_total_cost = test_price + distance(p, test_pos) * transport;
+            
+            var min_other_cost = 1e10;
+            for (var i = 0; i < MAX_FIRMS; i++) {
+                if (i == firm_id) { continue; }
+                let other = get_firm_main(i);
+                if (other.w <= 0.0) { continue; }
+                min_other_cost = min(min_other_cost, other.z + distance(p, other.xy) * transport);
+            }
+            if (my_total_cost < min_other_cost) {
+                revenue += 1.0 / (1.0 + exp(11.0 * (my_total_cost - 0.95)));
+            }
+        }
+    }
+
+    // 2. 동적 지가 기반 비용 계산
+    let current_lv = get_dynamic_land_value(test_pos, firm_id);
+    let boosted_rev = revenue * (1.0 + current_lv * 0.2); // 사람이 몰리면 매출도 약간 상승
+    let rent_cost = 0.05 + (current_lv * 0.3); // 지가가 높을수록 임대료 급증
+    
+    return (boosted_rev * test_price * 0.08) - rent_cost;
+}
+
 fn hash(p: vec2<f32>) -> f32 {
     return fract(sin(dot(p, vec2<f32>(12.9898, 78.233))) * 43758.5453);
 }
@@ -117,18 +169,24 @@ fn main_update(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 // ---------------------------------------------------------
-// 4. 시각화
+// 4. 시각화 (지가 시각화 레이어 추가 버전)
 // ---------------------------------------------------------
 @compute @workgroup_size(16, 16)
 fn main_compute(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = textureDimensions(screen);
-    if (id.y == 0u) { textureStore(screen, id.xy, vec4(0.0)); return; }
     let f_pos = vec2<f32>(id.xy) / vec2<f32>(size);
     let screen_size = vec2<f32>(size);
     
-    let lv = get_land_value(f_pos);
-    var final_col = vec3(0.01 + lv * 0.02, 0.01 + lv * 0.01, 0.02 + lv * 0.02);
+    // 실시간 지가 계산 (시각화용)
+    let lv = get_dynamic_land_value(f_pos, -1);
+    
+    // 지가 시각화: 낮음(검정/청색) -> 높음(붉은색/밝은 주황)
+    var final_col = mix(vec3(0.02, 0.02, 0.05), vec3(0.8, 0.2, 0.1), lv / 2.0);
+    
+    // 등고선 효과 추가
+    if (fract(lv * 5.0) > 0.9) { final_col += 0.05; }
 
+    // --- 2. 시장 지배력(Voronoi-like) 시각화 ---
     var min_cost = 100.0;
     var costs: array<f32, 64>;
     var is_active: array<bool, 64>;
@@ -147,34 +205,48 @@ fn main_compute(@builtin(global_invocation_id) id: vec3<u32>) {
     var acc_col = vec3(0.0);
     for (var i = 0; i < MAX_FIRMS; i++) {
         if (!is_active[i]) { continue; }
-        let w = exp(-12.0 * (costs[i] - min_cost));
-        let p = 1.0 / (1.0 + exp(12.0 * (costs[i] - 1.0)));
-        acc_col += get_distinct_color(i) * w * p;
+        // 시장 점유 농도 계산
+        let w = exp(-15.0 * (costs[i] - min_cost));
+        let affordability = 1.0 / (1.0 + exp(12.0 * (costs[i] - 1.2))); // 가격 저항선 시각화
+        acc_col += get_distinct_color(i) * w * affordability;
         total_w += w;
     }
-    if (total_w > 0.0) { final_col = mix(final_col, (acc_col / total_w), 0.5); }
+    
+    if (total_w > 0.0) { 
+        // 배경(지가)과 시장 색상을 혼합
+        final_col = mix(final_col, (acc_col / total_w), 0.45); 
+    }
 
+    // --- 3. 기업 본체(Agent) 시각화 ---
     for (var i = 0; i < MAX_FIRMS; i++) {
         let m = get_firm_main(i);
         let e = get_firm_ext(i);
         if (m.w <= 0.0) { continue; }
+        
         let dist = distance(f_pos * screen_size, m.xy * screen_size);
-        let radius = log(m.w + 1.0) * 15.0 + 5.0;
+        let radius = log(m.w + 1.0) * 12.0 + 4.0; // 자본금(w)에 따른 크기
         
         if (dist < radius) {
             let f_col = get_distinct_color(i);
-            let age_ratio = ((f32(time.frame) - e.x) % 6000.0) / 6000.0;
-            let angle = (atan2(f_pos.x - m.x, -(f_pos.y - m.y)) / 6.283) + 0.5;
+            let age_ratio = ((f32(time.frame) - e.x) % 300.0) / 300.0; // 주기적 박동 효과
             
-            var circle_col = vec3(0.0);
-            if (angle < age_ratio) { circle_col = mix(f_col, vec3(1.0), 0.7); }
-            else { circle_col = f_col * 0.2; }
-            if (dist > radius - (1.0 + m.z * 1.5)) { circle_col = vec3(1.0); }
+            var circle_col = f_col;
+            // 테두리 강조
+            if (dist > radius - 2.0) { 
+                circle_col = vec3(1.0); 
+            } else {
+                // 내부 가격 정보 시각화 (가격 z가 높을수록 밝음)
+                circle_col = mix(f_col, vec3(1.0), m.z * 0.3);
+            }
             final_col = circle_col;
         }
     }
 
+    // 마우스 상호작용 (선택 영역 지가 강조)
     let nm = vec2<f32>(mouse.pos) / screen_size;
-    if (mouse.click > 0 && distance(f_pos, nm) < 0.1) { final_col += vec3(0.2, 0.0, 0.0); }
-    textureStore(screen, id.xy, vec4(clamp(final_col, vec3(0.0), vec3(1.0)), 1.0));
+    if (mouse.click > 0 && distance(f_pos, nm) < 0.05) { 
+        final_col += vec3(0.1, 0.1, 0.0); 
+    }
+
+    textureStore(screen, id.xy, vec4(final_col, 1.0));
 }
