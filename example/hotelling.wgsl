@@ -1,7 +1,6 @@
 // ---------------------------------------------------------
-// 1. 전역 상수 및 유틸리티 (에러 수정: let -> const)
+// 1. 전역 상수 및 유틸리티
 // ---------------------------------------------------------
-
 const MAX_FIRMS: i32 = 64;
 
 fn hash(p: vec2<f32>) -> f32 {
@@ -15,39 +14,27 @@ fn hsv2rgb(c: vec3<f32>) -> vec3<f32> {
 }
 
 fn get_distinct_color(id: i32) -> vec3<f32> {
-    let golden_ratio_conjugate = 0.618033988749895;
-    var h = (f32(id) * golden_ratio_conjugate) % 1.0;
-    return hsv2rgb(vec3(h, 0.75, 0.9));
+    let f_id_val = f32(id);
+    let h = (f_id_val * 0.618033988749895) % 1.0;
+    let s = mix(0.4, 0.9, hash(vec2(f_id_val, 0.123)));
+    let v = mix(0.6, 1.0, hash(vec2(f_id_val, 0.456)));
+    return hsv2rgb(vec3(h, s, v));
 }
 
-// 데이터 접근 함수
-fn get_firm_main(id: i32) -> vec4<f32> {
-    return textureLoad(pass_in, vec2<i32>(id, 0), 0, 0);
-}
+fn get_firm_main(id: i32) -> vec4<f32> { return textureLoad(pass_in, vec2<i32>(id, 0), 0, 0); }
+fn get_firm_ext(id: i32) -> vec4<f32> { return textureLoad(pass_in, vec2<i32>(id + MAX_FIRMS, 0), 0, 0); }
 
-fn get_firm_ext(id: i32) -> vec4<f32> {
-    return textureLoad(pass_in, vec2<i32>(id + MAX_FIRMS, 0), 0, 0);
-}
-
-fn levy_step(seed: vec2<f32>, frame: f32) -> vec2<f32> {
-    let r1 = max(hash(seed + frame), 0.0001);
-    let r2 = hash(seed + frame + 0.5);
-    let alpha = 1.35; 
-    let length = pow(r1, -1.0 / alpha) * 0.004;
-    let angle = r2 * 6.283185;
-    return vec2<f32>(cos(angle), sin(angle)) * length;
+fn get_land_value(pos: vec2<f32>) -> f32 {
+    let center_dist = distance(pos, vec2<f32>(0.5, 0.5));
+    return exp(-1.5 * center_dist);
 }
 
 // ---------------------------------------------------------
-// 2. 경제 로직 (순서 중요: update 위에 배치)
+// 2. 경제 로직
 // ---------------------------------------------------------
-
 fn calc_total_profit(test_pos: vec2<f32>, test_price: f32, firm_id: i32) -> f32 {
     var revenue = 0.0;
-    let budget = 0.95;
-    let sensitivity = 11.0;
-    let transport = 2.0;
-
+    let transport = 2.2;
     for (var y = 0.1; y < 1.0; y += 0.2) {
         for (var x = 0.1; x < 1.0; x += 0.2) {
             let p = vec2<f32>(x, y);
@@ -57,12 +44,10 @@ fn calc_total_profit(test_pos: vec2<f32>, test_price: f32, firm_id: i32) -> f32 
                 if (i == firm_id) { continue; }
                 let other = get_firm_main(i);
                 if (other.w <= 0.0) { continue; }
-                let other_cost = other.z + distance(p, other.xy) * transport;
-                min_other_cost = min(min_other_cost, other_cost);
+                min_other_cost = min(min_other_cost, other.z + distance(p, other.xy) * transport);
             }
             if (my_cost < min_other_cost) {
-                let prob = 1.0 / (1.0 + exp(sensitivity * (my_cost - budget)));
-                revenue += prob;
+                revenue += 1.0 / (1.0 + exp(11.0 * (my_cost - 0.95)));
             }
         }
     }
@@ -70,9 +55,8 @@ fn calc_total_profit(test_pos: vec2<f32>, test_price: f32, firm_id: i32) -> f32 
 }
 
 // ---------------------------------------------------------
-// 3. 메인 업데이트 (데이터 확장 적용)
+// 3. 메인 업데이트 (수익성 기반 지가 시스템)
 // ---------------------------------------------------------
-
 @compute @workgroup_size(64, 1)
 fn main_update(@builtin(global_invocation_id) id: vec3<u32>) {
     let firm_id = i32(id.x);
@@ -81,50 +65,49 @@ fn main_update(@builtin(global_invocation_id) id: vec3<u32>) {
     var main_data = get_firm_main(firm_id);
     var ext_data = get_firm_ext(firm_id);
     let current_frame = f32(time.frame);
+    let f_id = f32(firm_id); // 에러 해결: f_id 선언
 
     if (time.frame < 1) {
-        if (firm_id < 8) {
-            main_data = vec4<f32>(hash(vec2(f32(firm_id), 0.1)), hash(vec2(f32(firm_id), 0.2)), 0.5, 1.2);
+        if (firm_id < 12) {
+            let start_pos = vec2(hash(vec2(f_id, 0.1)), hash(vec2(f_id, 0.2)));
+            main_data = vec4<f32>(start_pos, 0.5, 1.0);
             ext_data = vec4<f32>(current_frame, 0.0, 0.0, 0.0);
         }
     } else {
-        if (main_data.w <= 0.0) { // 폐업 상태
-    // 창업 확률 판정
-    let spawn_prob = hash(vec2(f32(firm_id), time.elapsed));
-    if (spawn_prob < 0.003) {
-        // [개선] 더 복잡한 시드를 사용하여 화면 전체에 골고루 뿌려지게 함
-        let seed_x = vec2(time.elapsed * 1.1, f32(firm_id) * 0.55);
-        let seed_y = vec2(time.elapsed * 2.2, f32(firm_id) * 0.88);
-        
-        let new_x = hash(seed_x);
-        let new_y = hash(seed_y);
-        
-        // 초기 자본 1.0, 초기 가격 0.5, 창업 프레임 기록
-        main_data = vec4<f32>(new_x, new_y, 0.5, 1.0);
-        ext_data = vec4<f32>(current_frame, 0.0, 0.0, 0.0);
-    }
-} else {
+        if (main_data.w <= 0.0) {
+            if (hash(vec2(f_id, time.elapsed)) < 0.002) {
+                let new_x = hash(vec2(time.elapsed * 1.1, f_id * 0.55));
+                let new_y = hash(vec2(time.elapsed * 2.2, f_id * 0.88));
+                main_data = vec4<f32>(new_x, new_y, 0.5, 1.0);
+                ext_data = vec4<f32>(current_frame, 0.0, 0.0, 0.0);
+            }
+        } else {
+            let land_v = get_land_value(main_data.xy);
             let rev = calc_total_profit(main_data.xy, main_data.z, firm_id);
-            var fixed_cost = 0.15;
+            let boosted_rev = rev * (1.0 + sqrt(land_v) * 0.4); 
+            let fixed_cost = 0.04 + (land_v * land_v * 0.25); 
             
-            let screen_size = vec2<f32>(textureDimensions(screen));
-            let norm_mouse = vec2<f32>(mouse.pos) / screen_size;
-            if (mouse.click > 0 && distance(norm_mouse, main_data.xy) < 0.1) { fixed_cost += 0.8; }
-
-            main_data.w += (rev * 0.25) - fixed_cost;
+            let current_net_profit = (boosted_rev * 0.08) - fixed_cost;
+            main_data.w += current_net_profit;
 
             if (main_data.w <= 0.0) {
                 main_data = vec4<f32>(0.0);
                 ext_data = vec4<f32>(0.0);
             } else {
-                let step = levy_step(main_data.xy, current_frame);
+                let r1 = max(hash(main_data.xy + current_frame), 0.0001);
+                let r2 = hash(main_data.xy + current_frame + 0.5);
+                let step = vec2(cos(r2 * 6.28), sin(r2 * 6.28)) * pow(r1, -1.0/1.35) * 0.0015;
                 let test_pos = clamp(main_data.xy + step, vec2(0.02), vec2(0.98));
-                let test_price = clamp(main_data.z + (hash(main_data.xy + current_frame) - 0.5) * 0.1, 0.2, 1.5);
                 
-                if (calc_total_profit(test_pos, test_price, firm_id) > rev) {
-                    main_data = vec4<f32>(test_pos, test_price, main_data.w);
-                } else {
-                    main_data = vec4<f32>(main_data.xy, main_data.z, main_data.w);
+                let test_lv = get_land_value(test_pos);
+                let test_rev = calc_total_profit(test_pos, main_data.z, firm_id);
+                let test_net_profit = (test_rev * (1.0 + sqrt(test_lv) * 0.4) * 0.08) - (0.04 + (test_lv * test_lv * 0.25));
+
+                let random_move = hash(vec2(f_id, time.elapsed)) < 0.005;
+                if (test_net_profit > current_net_profit || random_move) {
+                    main_data.x = test_pos.x;
+                    main_data.y = test_pos.y;
+                    main_data.z = clamp(main_data.z + (hash(main_data.xy + current_frame) - 0.5) * 0.02, 0.2, 1.5);
                 }
             }
         }
@@ -132,70 +115,66 @@ fn main_update(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(pass_out, vec2<i32>(firm_id, 0), 0, main_data);
     textureStore(pass_out, vec2<i32>(firm_id + MAX_FIRMS, 0), 0, ext_data);
 }
-// ---------------------------------------------------------
-// 시각화: 자본=크기, 생존시간=기업색상 연동 시계
-// ---------------------------------------------------------
 
+// ---------------------------------------------------------
+// 4. 시각화
+// ---------------------------------------------------------
 @compute @workgroup_size(16, 16)
 fn main_compute(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = textureDimensions(screen);
     if (id.y == 0u) { textureStore(screen, id.xy, vec4(0.0)); return; }
-    
     let f_pos = vec2<f32>(id.xy) / vec2<f32>(size);
     let screen_size = vec2<f32>(size);
-    var min_cost = 1e10;
-    var owner = -1;
+    
+    let lv = get_land_value(f_pos);
+    var final_col = vec3(0.01 + lv * 0.02, 0.01 + lv * 0.01, 0.02 + lv * 0.02);
 
-    // 1. 소비자 영역 계산
+    var min_cost = 100.0;
+    var costs: array<f32, 64>;
+    var is_active: array<bool, 64>;
+
     for (var i = 0; i < MAX_FIRMS; i++) {
-        let firm = get_firm_main(i);
-        if (firm.w <= 0.0) { continue; }
-        let cost = firm.z + distance(f_pos, firm.xy) * 2.2;
-        if (cost < min_cost) { min_cost = cost; owner = i; }
-    }
-
-    var col = vec3(0.01);
-    if (owner != -1) {
-        let base_col = get_distinct_color(owner);
-        col = base_col * (1.0 / (1.0 + exp(12.0 * (min_cost - 0.95)))) * 0.45;
-    }
-
-    // 2. 기업 상점 및 생존 시계 렌더링
-    for (var i = 0; i < MAX_FIRMS; i++) {
-        let main = get_firm_main(i);
-        let ext = get_firm_ext(i);
-        if (main.w <= 0.0) { continue; }
-        
-        let center = main.xy * screen_size;
-        let dist = distance(f_pos * screen_size, center);
-        
-        // [변경] 로그 스케일 적용
-        // log(main.w + 1.0)을 쓰는 이유: 자본이 0일 때 log(1)=0이 되어 음수를 방지함
-        // 15.0은 기본 스케일 계수, 5.0은 최소 반지름입니다.
-        let radius = log(main.w + 1.0) * 15.0 + 5.0; 
-        
-        if (dist < radius) {
-            let firm_col = get_distinct_color(i);
-            let age = f32(time.frame) - ext.x;
-            let age_ratio = (age % 3000.0) / 3000.0;
-            
-            let dir = (f_pos * screen_size) - center;
-            let angle = (atan2(dir.x, -dir.y) / 6.28318) + 0.5;
-            
-            if (angle < age_ratio) {
-                col = mix(firm_col, vec3(1.0), 0.7);
-            } else {
-                col = firm_col * 0.25;
-            }
-            
-            let border_width = 1.0 + (main.z * 1.5);
-            if (dist > radius - border_width) {
-                col = vec3(1.0); 
-            }
+        let f = get_firm_main(i);
+        is_active[i] = f.w > 0.0;
+        if (is_active[i]) {
+            let c = f.z + distance(f_pos, f.xy) * 2.2;
+            costs[i] = c;
+            min_cost = min(min_cost, c);
         }
     }
-    
-    let norm_mouse = vec2<f32>(mouse.pos) / screen_size;
-    if (mouse.click > 0 && distance(f_pos, norm_mouse) < 0.1) { col += vec3(0.2, 0.0, 0.0); }
-    textureStore(screen, id.xy, vec4(col, 1.0));
+
+    var total_w = 0.0;
+    var acc_col = vec3(0.0);
+    for (var i = 0; i < MAX_FIRMS; i++) {
+        if (!is_active[i]) { continue; }
+        let w = exp(-12.0 * (costs[i] - min_cost));
+        let p = 1.0 / (1.0 + exp(12.0 * (costs[i] - 1.0)));
+        acc_col += get_distinct_color(i) * w * p;
+        total_w += w;
+    }
+    if (total_w > 0.0) { final_col = mix(final_col, (acc_col / total_w), 0.5); }
+
+    for (var i = 0; i < MAX_FIRMS; i++) {
+        let m = get_firm_main(i);
+        let e = get_firm_ext(i);
+        if (m.w <= 0.0) { continue; }
+        let dist = distance(f_pos * screen_size, m.xy * screen_size);
+        let radius = log(m.w + 1.0) * 15.0 + 5.0;
+        
+        if (dist < radius) {
+            let f_col = get_distinct_color(i);
+            let age_ratio = ((f32(time.frame) - e.x) % 6000.0) / 6000.0;
+            let angle = (atan2(f_pos.x - m.x, -(f_pos.y - m.y)) / 6.283) + 0.5;
+            
+            var circle_col = vec3(0.0);
+            if (angle < age_ratio) { circle_col = mix(f_col, vec3(1.0), 0.7); }
+            else { circle_col = f_col * 0.2; }
+            if (dist > radius - (1.0 + m.z * 1.5)) { circle_col = vec3(1.0); }
+            final_col = circle_col;
+        }
+    }
+
+    let nm = vec2<f32>(mouse.pos) / screen_size;
+    if (mouse.click > 0 && distance(f_pos, nm) < 0.1) { final_col += vec3(0.2, 0.0, 0.0); }
+    textureStore(screen, id.xy, vec4(clamp(final_col, vec3(0.0), vec3(1.0)), 1.0));
 }
