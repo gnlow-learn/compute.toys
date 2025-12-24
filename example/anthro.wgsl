@@ -8,7 +8,7 @@ struct Agent {
 
 #storage agents array<Agent, 1024>
 
-// --- 유틸리티 함수 (기존 유지) ---
+// --- 해시 함수들 ---
 fn pcg2d(p: vec2u) -> vec2f {
     var v = p * 1664525u + 1013904223u;
     v.x += v.y * 1664525u; v.y += v.x * 1664525u;
@@ -16,6 +16,15 @@ fn pcg2d(p: vec2u) -> vec2f {
     v.x += v.y * 1664525u; v.y += v.x * 1664525u;
     v = v ^ (v >> vec2u(16u));
     return vec2f(v) * (1.0 / f32(0xffffffffu));
+}
+
+// 3차원 랜덤 값을 위한 새로운 함수
+fn pcg3d(p: vec3u) -> vec3f {
+    var v = p * 1664525u + 1013904223u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    v = v ^ (v >> vec3u(16u));
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    return vec3f(v) * (1.0 / f32(0xffffffffu));
 }
 
 fn hash12(p: vec2f) -> f32 {
@@ -57,7 +66,7 @@ fn sample_food(pos: vec2f, size: vec2u) -> f32 {
     return textureLoad(pass_in, coords, 0, 0).y;
 }
 
-// --- 메인 시뮬레이션 엔진 ---
+// --- 메인 시뮬레이션 ---
 @compute @workgroup_size(16, 16)
 fn main_compute(@builtin(global_invocation_id) id: vec3u) {
     let size = textureDimensions(screen);
@@ -65,16 +74,10 @@ fn main_compute(@builtin(global_invocation_id) id: vec3u) {
     let uv = vec2f(id.xy) / vec2f(size);
     let sea_level = 0.5;
     
-    // 1. 지형 및 식량 재생
     let h = get_height(uv);
     var food = textureLoad(pass_in, pos_i, 0, 0).y;
-    if (h >= sea_level) { 
-        food = min(food + 0.0005, 1.0); // 고정 재생 속도
-    } else { 
-        food = 0.0; 
-    }
+    if (h >= sea_level) { food = min(food + 0.0005, 1.0); } else { food = 0.0; }
 
-    // 2. 밸런싱된 식량 소모 (50명일 때 유지, 100명일 때 고갈)
     let agent_count = 1024u;
     for (var i = 0u; i < agent_count; i++) {
         if (agents[i].alive > 0.5) {
@@ -82,7 +85,6 @@ fn main_compute(@builtin(global_invocation_id) id: vec3u) {
             let consume_radius = sqrt(agents[i].pop) * 1.6;
             if (dist < consume_radius) {
                 let falloff = 1.0 - (dist / consume_radius);
-                // drain_rate를 0.00008 정도로 설정하여 인구 100명일 때 재생 속도를 넘어서게 조절
                 let drain = falloff * agents[i].pop * 0.00008; 
                 food = max(food - drain, 0.0);
             }
@@ -98,9 +100,25 @@ fn main_compute(@builtin(global_invocation_id) id: vec3u) {
                 a.pos = vec2f(0.5, 0.5); a.color = vec3f(1.0, 0.8, 0.2); a.alive = 1.0; a.pop = 30.0; a.dir = 0.0;
             } else { a.alive = 0.0; }
         } else if (a.alive > 0.5) {
-            let r = pcg2d(vec2u(bitcast<u32>(a.pos.x * 1537.0), bitcast<u32>(a.pos.y * 1537.0)) + vec2u(tid, time.frame));
+            let r_pos = pcg2d(vec2u(bitcast<u32>(a.pos.x * 1537.0), bitcast<u32>(a.pos.y * 1537.0)) + vec2u(tid, time.frame));
             
-            // 이동 (초저속 유지)
+            // 1. 돌연변이 (pcg3d 사용으로 에러 해결)
+            if (r_pos.x < 0.01) { 
+                let mut_val = pcg3d(vec3u(tid, time.frame, 123u)) - 0.5;
+                a.color = clamp(a.color + mut_val * 0.05, vec3f(0.1), vec3f(1.0));
+            }
+
+            // 2. 유전적 동화 (Genetic Assimilation)
+            let other_idx = u32(r_pos.y * f32(agent_count)) % agent_count;
+            let other = agents[other_idx];
+            if (other.alive > 0.5 && other_idx != tid) {
+                let d = distance(a.pos, other.pos);
+                if (d < 0.05) { 
+                    a.color = mix(a.color, other.color, 0.02);
+                }
+            }
+
+            // 이동 및 센싱
             let sensor_dist = 0.015;
             let sensor_angle = 0.65;
             let f_left  = sample_food(a.pos + vec2f(cos(a.dir - sensor_angle), sin(a.dir - sensor_angle)) * sensor_dist, size);
@@ -109,40 +127,37 @@ fn main_compute(@builtin(global_invocation_id) id: vec3u) {
             
             if (f_left > f_front && f_left > f_right) { a.dir -= 0.05; }
             else if (f_right > f_front && f_right > f_left) { a.dir += 0.05; }
-            a.dir += (r.x - 0.5) * 0.02;
+            a.dir += (r_pos.x - 0.5) * 0.02;
 
-            var step_size = 0.00004 / max(r.y * r.y, 0.005); 
+            var step_size = 0.00004 / max(r_pos.y * r_pos.y, 0.005); 
             step_size = min(step_size, 0.0008); 
             let next_pos = fract(a.pos + vec2f(cos(a.dir), sin(a.dir)) * step_size);
             if (get_height(next_pos) >= sea_level) { a.pos = next_pos; } 
-            else { a.dir += 3.14159 * (r.x + 0.5); }
+            else { a.dir += 3.14159 * (r_pos.x + 0.5); }
 
-            // 3. 인구 변화 (임계점 기반 성장/감소)
+            // 3. 인구 변화
             let current_food = sample_food(a.pos, size);
-            let demand = a.pop * 0.001; // 인구당 요구치 미세 조정
-            
+            let demand = a.pop * 0.001;
             if (current_food > demand) {
                 a.pop += (current_food - demand) * 0.4; 
             } else {
-                // 아사 패널티를 15.0에서 5.0으로 완화하여 기근 시 버티는 시간 확보
                 a.pop -= (demand - current_food) * 5.0 + 0.05; 
             }
 
-            // 4. 분열 로직 (해시 기반)
-            // 임계점이 70~80이므로 100 근처에서 분열하도록 설정
+            // 4. 분열 로직
             if (a.pop > 100.0) {
-                var seed = u32(r.x * 12345.0) + tid;
+                var seed = u32(r_pos.x * 12345.0) + tid;
                 for (var i = 0u; i < 8u; i++) {
                     let rand_val = pcg2d(vec2u(seed, i)).x;
                     let child_idx = u32(rand_val * f32(agent_count)) % agent_count;
                     if (agents[child_idx].alive < 0.5) {
-                        let parent_pop = a.pop * 0.42; // 분열 효율 약간 상향
+                        let parent_pop = a.pop * 0.42;
                         a.pop = parent_pop;
                         agents[child_idx].pos = a.pos;
                         agents[child_idx].alive = 1.0;
                         agents[child_idx].pop = parent_pop;
                         agents[child_idx].dir = a.dir + (pcg2d(vec2u(seed)).x * 6.28);
-                        agents[child_idx].color = clamp(a.color + (pcg2d(vec2u(child_idx)).xyx - 0.5) * 0.1, vec3f(0.2), vec3f(1.0));
+                        agents[child_idx].color = a.color; 
                         break; 
                     }
                     seed += 1u;
