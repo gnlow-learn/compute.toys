@@ -1,12 +1,20 @@
 const STEEPNESS: f32 = 1.0; 
 const CENTER: f32 = 0.0;    
 
-// 시간축 Reaction-Diffusion 파라미터 튜닝
+// --- 사용자 튜닝 파라미터 (철저히 유지) ---
 const BORDER_THRESHOLD: f32 = 0.03; 
-const GROWTH_RATE: f32 = 0.04;       // 선이 형성되는 속도
-const INHIBITION_RATE: f32 = 0.01;   // 배경 청소 속도 (살짝 낮춰서 선의 잔상을 유지)
-const TEMPORAL_DIFFUSION: f32 = 0.5; // 시간축 확산 강도 (0.0~1.0, 높을수록 선이 끈적하게 연결됨)
-const SHARPNESS: f32 = 10.0;         
+const SHARPNESS: f32 = 10.0;        
+const TEMPORAL_DIFFUSION: f32 = 0.5; 
+
+// --- 시간 민감도 통합 제어 ---
+const TIME_SENSITIVITY: f32 = 0.5; 
+const GROWTH_RATE: f32 = 0.04 * TIME_SENSITIVITY;
+const INHIBITION_RATE: f32 = 0.01 * TIME_SENSITIVITY;
+
+// --- [시각화 전용] 선 압축 강도 ---
+// 1.0: 원본 두께 / 5.0 이상: 매우 예리한 실선
+// (기록되는 데이터에는 영향을 주지 않음)
+const LINE_COMPRESSION: f32 = 4.5; 
 
 @compute @workgroup_size(16, 16)
 fn main_compute(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -19,7 +27,7 @@ fn main_compute(@builtin(global_invocation_id) id: vec3<u32>) {
     var feature = prev_data.rg;
     var next_feature = feature;
 
-    // 1. 시뮬레이션 업데이트 (유지)
+    // 1. 시뮬레이션 업데이트 (사용자 로직)
     if (time.elapsed < 0.2 || (feature.x == 0.0 && feature.y == 0.0)) {
         next_feature = vec2<f32>(hash(vec2<f32>(pos) * 1.2), hash(vec2<f32>(pos) * 3.4));
     } else {
@@ -42,28 +50,23 @@ fn main_compute(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
-    // 2. [공간 감지] + [시간축 확산 준비]
+    // 2. 공간 신호 감지 및 시간축 에너지 확산
     var spatial_signal = 0.0;
     var neighbor_mem_avg = 0.0;
     let offsets = array<vec2<i32>, 4>(vec2<i32>(1,0), vec2<i32>(-1,0), vec2<i32>(0,1), vec2<i32>(0,-1));
-    
     for (var i = 0; i < 4; i++) {
         let n_pos = (pos + offsets[i] + size) % size;
         let n_data = textureLoad(pass_in, n_pos, 0, 0);
-        spatial_signal += distance(next_feature, n_data.rg); // 공간 신호 감지
-        neighbor_mem_avg += n_data.b;                        // 주변 시간축 에너지 수집
+        spatial_signal += distance(next_feature, n_data.rg);
+        neighbor_mem_avg += n_data.b;
     }
     spatial_signal /= 4.0;
     neighbor_mem_avg /= 4.0;
 
-    // 3. [시간축 Reaction-Diffusion]
-    // 현재 픽셀의 메모리와 주변 픽셀의 메모리를 섞어 '확산(Diffusion)'을 일으킵니다.
-    var border_mem = mix(prev_data.b, neighbor_mem_avg, TEMPORAL_DIFFUSION);
-    
-    // 비선형 증폭 타겟
+    // 3. 시간축 Reaction-Diffusion (데이터 기록용)
+    var border_mem = mix(max(0.0, prev_data.b), max(0.0, neighbor_mem_avg), TEMPORAL_DIFFUSION);
     let target_val = 1.0 / (1.0 + exp(-SHARPNESS * (spatial_signal - BORDER_THRESHOLD)));
     
-    // 반응(Reaction) 로직
     if (target_val > 0.5) {
         border_mem += (target_val - border_mem) * GROWTH_RATE;
     } else {
@@ -71,12 +74,18 @@ fn main_compute(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     border_mem = clamp(border_mem, 0.0, 1.0);
 
-    // 4. 저장 및 출력
+    // [중요] 다음 프레임 시뮬레이션을 위해 원본 border_mem 저장
     textureStore(pass_out, pos, 0, vec4<f32>(next_feature.x, next_feature.y, border_mem, 1.0));
 
+    // 4. 비선형 압축 시각화 (화면 출력용)
+    // 에너지를 거듭제곱하여 분포의 끝자락을 수축시킵니다.
+    let compressed_energy = pow(max(0.0, border_mem), LINE_COMPRESSION);
+
     let base_rgb = vec3<f32>(next_feature.x, next_feature.y, 0.6);
-    let line_mask = smoothstep(0.4, 0.5, border_mem);
-    let final_rgb = mix(base_rgb, vec3<f32>(0.0, 0.0, 0.0), line_mask);
+    
+    // 에너지가 아주 조금이라도 있으면 그리기 위해 문턱값을 대폭 낮춤
+    let line_mask = smoothstep(0.01, 0.1, compressed_energy);
+    let final_rgb = mix(base_rgb, vec3<f32>(0.0), line_mask);
     
     textureStore(screen, pos, vec4<f32>(final_rgb, 1.0));
 }
