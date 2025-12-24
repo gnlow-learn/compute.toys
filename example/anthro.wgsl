@@ -72,11 +72,13 @@ fn main_compute(@builtin(global_invocation_id) id: vec3u) {
     let uv = vec2f(id.xy) / vec2f(size);
     let sea_level = 0.5;
     
-    // 1. 지형 및 식량 재생 (모든 픽셀 동일)
+    // 1. 지형 및 식량 재생
     let h = get_height(uv);
     var food = textureLoad(pass_in, pos_i, 0, 0).y;
-    // 바다(h < 0.5)인 경우 식량은 항상 0입니다.
-    if (h >= sea_level) { food = min(food + 0.0005, 1.0); } else { food = 0.0; }
+    
+    // [수정] 바다 식량 로직: 육지는 1.0까지, 바다는 0.1까지 재생
+    let max_food = select(0.1, 1.0, h >= sea_level);
+    food = min(food + 0.0005, max_food);
 
     let agent_count = 1024u;
     for (var i = 0u; i < agent_count; i++) {
@@ -98,45 +100,46 @@ fn main_compute(@builtin(global_invocation_id) id: vec3u) {
             if (time.frame == 0u) {
                 if (i == 0u) {
                     a.pos = vec2f(0.5, 0.5); a.color = vec3f(1.0, 0.8, 0.2); a.alive = 1.0; a.pop = 30.0; a.dir = 0.0;
-                } else { a.alive = 0.0; a.pop = 0.0; }
+                } else { a.alive = 0.0; }
             } else if (a.alive > 0.5) {
                 let r_seed = pcg2d(vec2u(bitcast<u32>(a.pos.x * 1537.0), i) + vec2u(time.frame));
                 
-                // 식량 센싱 (이미 바다인지 육지인지 정보를 포함함)
                 let cur_food = sample_food(a.pos, size);
+                let cur_h = sample_height(a.pos, size);
+                let demand = a.pop * 0.001;
+
+                // [수정] 이동 속도 페널티: 육지(0.0005) -> 심해(0.00005)까지 h에 비례
+                // 얕은 물일수록 h가 0.5에 가깝고, 심해일수록 0에 가깝습니다.
+                let speed = mix(0.00005, 0.0005, clamp(cur_h * 2.0, 0.1, 1.0));
+
+                // 바다 회피 (식량 기반)
                 let sensor_dist = 0.015;
                 let sensor_angle = 0.65;
                 let f_left  = sample_food(a.pos + vec2f(cos(a.dir - sensor_angle), sin(a.dir - sensor_angle)) * sensor_dist, size);
                 let f_front = sample_food(a.pos + vec2f(cos(a.dir), sin(a.dir)) * sensor_dist, size);
                 let f_right = sample_food(a.pos + vec2f(cos(a.dir + sensor_angle), sin(a.dir + sensor_angle)) * sensor_dist, size);
                 
-                let demand = a.pop * 0.001;
-
-                // [최적화 핵심] 식량이 0인 곳(바다)을 회피
-                // 단, 배가 고프지 않을 때만 회피 로직 작동
-                if (f_front <= 0.0 && cur_food >= demand) {
-                    a.dir += 0.15; // 바다 쪽이면 방향을 틈
+                // 식량이 0.1 근처(바다)라면 기피하되, 배고프면(cur_food < demand) 무시
+                if (f_front <= 0.15 && cur_food >= demand) {
+                    a.dir += 0.15;
                 }
 
-                // 조향 로직
                 if (f_left > f_front && f_left > f_right) { a.dir -= 0.05; }
                 else if (f_right > f_front && f_right > f_left) { a.dir += 0.05; }
                 a.dir += (r_seed.x - 0.5) * 0.02;
 
-                // 이동 속도 결정 (현재 위치 식량이 0이면 바다로 간주하여 느려짐)
-                let speed = select(0.0001, 0.0005, cur_food > 0.0);
                 a.pos = fract(a.pos + vec2f(cos(a.dir), sin(a.dir)) * speed);
 
                 // 인구 변화
                 if (cur_food > demand) { 
                     a.pop += (cur_food - demand) * 0.4; 
                 } else { 
-                    // 바다(cur_food == 0)이면 더 빨리 굶어죽음
-                    let starv_rate = select(15.0, 5.0, cur_food > 0.0);
+                    // 깊은 바다일수록 더 치명적인 생존 페널티
+                    let starv_rate = mix(20.0, 5.0, clamp(cur_h * 2.0, 0.0, 1.0));
                     a.pop -= (demand - cur_food) * starv_rate + 0.05; 
                 }
 
-                // 분열/합병/변이 (기존과 동일)
+                // 분열 및 합병
                 if (a.pop > 100.0) {
                     for (var j = 0u; j < 4u; j++) {
                         let c_idx = u32(pcg2d(vec2u(i, j + time.frame)).x * f32(agent_count)) % agent_count;
@@ -147,9 +150,9 @@ fn main_compute(@builtin(global_invocation_id) id: vec3u) {
                         }
                     }
                 }
-                if (r_seed.x < 0.02) {
-                    a.color = clamp(a.color + (pcg3d(vec3u(i, time.frame, 99u)) - 0.5) * (0.2 / (sqrt(a.pop) + 1.0)), vec3f(0.1), vec3f(1.0));
-                }
+                
+                // 돌연변이 & 합병 (생략 방지)
+                if (r_seed.x < 0.02) { a.color = clamp(a.color + (pcg3d(vec3u(i, time.frame, 99u)) - 0.5) * (0.2 / (sqrt(a.pop) + 1.0)), vec3f(0.1), vec3f(1.0)); }
                 let other_idx = u32(r_seed.y * f32(agent_count)) % agent_count;
                 if (other_idx != i && agents[other_idx].alive > 0.5) {
                     let other = agents[other_idx];
@@ -157,8 +160,7 @@ fn main_compute(@builtin(global_invocation_id) id: vec3u) {
                         let total_pop = a.pop + other.pop;
                         if (distance(a.color, other.color) < (0.8 / (total_pop * 0.01 + 1.0))) {
                             a.color = mix(a.color, other.color, other.pop / total_pop);
-                            a.pop = total_pop;
-                            agents[other_idx].alive = 0.0; 
+                            a.pop = total_pop; agents[other_idx].alive = 0.0; 
                         }
                     }
                 }
@@ -168,10 +170,12 @@ fn main_compute(@builtin(global_invocation_id) id: vec3u) {
         }
     }
 
-    // --- 3. 렌더링 (지시대로 전수 조사 유지) ---
+    // --- 3. 렌더링 ---
     var final_col: vec3f;
     if (h < sea_level) {
-        final_col = mix(vec3f(0.02, 0.05, 0.1), vec3f(0.1, 0.2, 0.3), h / sea_level);
+        // 식량이 0.1 있으므로 바다에서도 약간의 초록빛(플랑크톤 같은 느낌)이 돕니다.
+        let water = mix(vec3f(0.02, 0.05, 0.1), vec3f(0.1, 0.2, 0.3), h / sea_level);
+        final_col = water + vec3f(0.0, 0.15, 0.05) * food;
     } else {
         let land = mix(vec3f(0.2, 0.15, 0.1), vec3f(0.4, 0.4, 0.3), (h - sea_level) * 2.0);
         let forest = vec3f(0.02, 0.4, 0.08) * food;
