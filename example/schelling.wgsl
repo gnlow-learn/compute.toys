@@ -1,5 +1,5 @@
 const STEEPNESS: f32 = 1.0; 
-const CENTER: f32 = 0.0;    
+const CENTER: f32 = 1.0;    
 
 // --- 사용자 튜닝 파라미터 (철저히 유지) ---
 const BORDER_THRESHOLD: f32 = 0.03; 
