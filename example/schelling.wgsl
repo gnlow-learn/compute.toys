@@ -1,8 +1,12 @@
 const STEEPNESS: f32 = 1.0; 
 const CENTER: f32 = 0.0;    
-const BORDER_THRESHOLD: f32 = 0.12; 
-const BORDER_SMOOTHNESS: f32 = 0.08;
-const TEMPORAL_SMOOTHING: f32 = 0.95; // 높을수록 선이 더 끈적하고 부드럽게 변함
+
+// 시간축 Reaction-Diffusion 파라미터 튜닝
+const BORDER_THRESHOLD: f32 = 0.03; 
+const GROWTH_RATE: f32 = 0.04;       // 선이 형성되는 속도
+const INHIBITION_RATE: f32 = 0.01;   // 배경 청소 속도 (살짝 낮춰서 선의 잔상을 유지)
+const TEMPORAL_DIFFUSION: f32 = 0.5; // 시간축 확산 강도 (0.0~1.0, 높을수록 선이 끈적하게 연결됨)
+const SHARPNESS: f32 = 10.0;         
 
 @compute @workgroup_size(16, 16)
 fn main_compute(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -10,15 +14,12 @@ fn main_compute(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= u32(size.x) || id.y >= u32(size.y)) { return; }
 
     let pos = vec2<i32>(id.xy);
-    
-    // pass_in에서 이전 프레임 데이터를 읽어옵니다.
-    // r, g: 색상 데이터 / b: 이전 프레임의 국경선 강도(시간축 메모리)
     let prev_data = textureLoad(pass_in, pos, 0, 0);
     
     var feature = prev_data.rg;
     var next_feature = feature;
 
-    // 1. 업데이트 로직 (유지)
+    // 1. 시뮬레이션 업데이트 (유지)
     if (time.elapsed < 0.2 || (feature.x == 0.0 && feature.y == 0.0)) {
         next_feature = vec2<f32>(hash(vec2<f32>(pos) * 1.2), hash(vec2<f32>(pos) * 3.4));
     } else {
@@ -41,28 +42,42 @@ fn main_compute(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
-    // 2. 공간축 가우시안 (Spatial Smoothing)
-    var spatial_diff = 0.0;
-    for (var fy: i32 = -1; fy <= 1; fy++) {
-        for (var fx: i32 = -1; fx <= 1; fx++) {
-            let n_pos = (pos + vec2<i32>(fx, fy) + size) % size;
-            spatial_diff += distance(next_feature, textureLoad(pass_in, n_pos, 0, 0).rg);
-        }
+    // 2. [공간 감지] + [시간축 확산 준비]
+    var spatial_signal = 0.0;
+    var neighbor_mem_avg = 0.0;
+    let offsets = array<vec2<i32>, 4>(vec2<i32>(1,0), vec2<i32>(-1,0), vec2<i32>(0,1), vec2<i32>(0,-1));
+    
+    for (var i = 0; i < 4; i++) {
+        let n_pos = (pos + offsets[i] + size) % size;
+        let n_data = textureLoad(pass_in, n_pos, 0, 0);
+        spatial_signal += distance(next_feature, n_data.rg); // 공간 신호 감지
+        neighbor_mem_avg += n_data.b;                        // 주변 시간축 에너지 수집
     }
-    let current_border = smoothstep(BORDER_THRESHOLD, BORDER_THRESHOLD + BORDER_SMOOTHNESS, spatial_diff / 9.0);
+    spatial_signal /= 4.0;
+    neighbor_mem_avg /= 4.0;
 
-    // 3. 시간축 가우시안 (Temporal Smoothing)
-    // 이전 프레임의 b 채널 값을 가져와 현재 국경선 강도와 섞습니다.
-    let prev_border = prev_data.b;
-    let smooth_border = mix(current_border, prev_border, TEMPORAL_SMOOTHING);
+    // 3. [시간축 Reaction-Diffusion]
+    // 현재 픽셀의 메모리와 주변 픽셀의 메모리를 섞어 '확산(Diffusion)'을 일으킵니다.
+    var border_mem = mix(prev_data.b, neighbor_mem_avg, TEMPORAL_DIFFUSION);
+    
+    // 비선형 증폭 타겟
+    let target_val = 1.0 / (1.0 + exp(-SHARPNESS * (spatial_signal - BORDER_THRESHOLD)));
+    
+    // 반응(Reaction) 로직
+    if (target_val > 0.5) {
+        border_mem += (target_val - border_mem) * GROWTH_RATE;
+    } else {
+        border_mem -= border_mem * INHIBITION_RATE;
+    }
+    border_mem = clamp(border_mem, 0.0, 1.0);
 
-    // 4. 데이터 보존 및 출력
-    // 다음 프레임을 위해 b 채널에 매끄러워진 국경선 정보를 저장합니다.
-    textureStore(pass_out, pos, 0, vec4<f32>(next_feature.x, next_feature.y, smooth_border, 1.0));
+    // 4. 저장 및 출력
+    textureStore(pass_out, pos, 0, vec4<f32>(next_feature.x, next_feature.y, border_mem, 1.0));
 
-    // 최종 화면 렌더링
     let base_rgb = vec3<f32>(next_feature.x, next_feature.y, 0.6);
-    let final_rgb = mix(base_rgb, vec3<f32>(0.0), smooth_border);
+    let line_mask = smoothstep(0.4, 0.5, border_mem);
+    let final_rgb = mix(base_rgb, vec3<f32>(0.0, 0.0, 0.0), line_mask);
+    
     textureStore(screen, pos, vec4<f32>(final_rgb, 1.0));
 }
 
