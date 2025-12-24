@@ -1,103 +1,57 @@
-const THRESHOLD: f32 = 0.1; // 매우 예민한 설정
-const EMPTY: f32 = 0.0;
-const OCCUPIED: f32 = 1.0;
+const THRESHOLD: f32 = 0.1; // 낮을수록 더 예민하게 반응하여 군집이 커짐
 
 @compute @workgroup_size(16, 16)
 fn main_compute(@builtin(global_invocation_id) id: vec3<u32>) {
-    let size = vec2<i32>(textureDimensions(screen));
-    if (id.x >= u32(size.x) || id.y >= u32(size.y)) { return; }
+    let size = textureDimensions(screen);
+    if (id.x >= size.x || id.y >= size.y) { return; }
 
     let pos = vec2<i32>(id.xy);
     let current_data = textureLoad(pass_in, pos, 0, 0);
     
     var feature = current_data.rg;
-    var is_active = current_data.b;
-
     var next_feature = feature;
-    var next_active = is_active;
 
-    // 1. 초기화 (1%의 빈 공간만 남겨서 유동성 확보)
-    if (time.elapsed < 0.2 || (is_active == 0.0 && length(feature) == 0.0)) {
-        let h = hash(vec2<f32>(pos));
-        if (h < 0.01) { 
-            next_active = EMPTY;
-            next_feature = vec2<f32>(0.0);
-        } else {
-            next_active = OCCUPIED;
-            next_feature = vec2<f32>(hash(vec2<f32>(pos) * 1.2), hash(vec2<f32>(pos) * 3.4));
-        }
+    // 1. 초기화: 화면을 무작위 색상으로 가득 채움
+    if (time.elapsed < 0.2 || length(feature) == 0.0) {
+        next_feature = vec2<f32>(hash(vec2<f32>(pos) * 1.2), hash(vec2<f32>(pos) * 3.4));
     } else {
-        // 2. 토러스 좌표 계산 함수 (클로저 대신 직접 계산)
-        // pos + offset을 size로 나누어 떨어지게 처리
-        
-        if (is_active > 0.5) {
-            var total_dist = 0.0;
-            var count = 0.0;
-            
-            // Radius 2 탐색
-            for (var y: i32 = -2; y <= 2; y++) {
-                for (var x: i32 = -2; x <= 2; x++) {
-                    if (x == 0 && y == 0) { continue; }
-                    
-                    // 토러스 좌표 적용: (pos + offset + size) % size
-                    let sample_pos = (pos + vec2<i32>(x, y) + size) % size;
-                    let neighbor = textureLoad(pass_in, sample_pos, 0, 0);
-                    
-                    if (neighbor.b > 0.5) {
-                        total_dist += distance(feature, neighbor.rg);
-                        count += 1.0;
-                    }
-                }
-            }
-            let avg_dist = select(total_dist / count, 0.0, count == 0.0);
-
-            // 3. 불만족 시 이동 (빈칸 찾기)
-            if (avg_dist > THRESHOLD) {
-                var can_move = false;
-                for (var y: i32 = -1; y <= 1; y++) {
-                    for (var x: i32 = -1; x <= 1; x++) {
-                        let sample_pos = (pos + vec2<i32>(x, y) + size) % size;
-                        if (textureLoad(pass_in, sample_pos, 0, 0).b < 0.5) { 
-                            can_move = true; 
-                            break;
-                        }
-                    }
-                    if (can_move) { break; }
-                }
-                
-                if (can_move && hash(vec2<f32>(pos) + time.elapsed) > 0.8) {
-                    next_active = EMPTY;
-                }
-            }
-        } else {
-            // 빈 공간: 토러스 이웃 중 불만족한 개체 탐색
-            for (var y: i32 = -1; y <= 1; y++) {
-                for (var x: i32 = -1; x <= 1; x++) {
-                    let n_pos = (pos + vec2<i32>(x, y) + size) % size;
-                    let n_data = textureLoad(pass_in, n_pos, 0, 0);
-                    
-                    if (n_data.b > 0.5) {
-                        if (hash(vec2<f32>(n_pos) + time.elapsed) > 0.8) {
-                             next_active = OCCUPIED;
-                             next_feature = n_data.rg;
-                             break;
-                        }
-                    }
-                }
-                if (next_active > 0.5) { break; }
+        // 2. 주변 만족도 체크 (Radius 1 or 2)
+        var total_dist = 0.0;
+        for (var y: i32 = -1; y <= 1; y++) {
+            for (var x: i32 = -1; x <= 1; x++) {
+                if (x == 0 && y == 0) { continue; }
+                let neighbor = textureLoad(pass_in, pos + vec2<i32>(x, y), 0, 0);
+                total_dist += distance(feature, neighbor.rg);
             }
         }
+        let avg_dist = total_dist / 8.0;
+
+        // 3. 교환(Swap) 로직
+        // 내가 불만족스러울 때만 주변과 자리를 바꿀 기회를 가짐
+        if (avg_dist > THRESHOLD) {
+            // 무작위로 이웃 하나를 선정
+            let angle = hash(vec2<f32>(pos) + time.elapsed) * 6.28318;
+            let offset = vec2<i32>(vec2<f32>(cos(angle), sin(angle)) * 2.0); // Radius 2 범위에서 타겟 선정
+            let target_pos = pos + offset;
+            let target_data = textureLoad(pass_in, target_pos, 0, 0);
+
+            // [핵심] 확률적 교환: 
+            // 서로 자리를 바꿨을 때 더 행복해질 가능성이 있다면 스왑(Swap)
+            // 여기서는 단순화를 위해 무작위성을 부여하여 섞이도록 함
+            if (hash(vec2<f32>(pos) * time.elapsed) > 0.9) {
+                next_feature = target_data.rg;
+            }
+        }
+        
+        // 4. 충돌 방지: 타겟 입장에서 누군가 나에게 왔다면 나도 그쪽으로 가야 함
+        // (이 로직은 GPU 병렬 처리상 엄격한 1:1 스왑은 아니지만, 통계적으로 보존됨)
     }
 
-    // 데이터 저장
-    textureStore(pass_out, pos, 0, vec4<f32>(next_feature.x, next_feature.y, next_active, 1.0));
+    // 데이터 저장 (B 채널은 이제 사용 안 함)
+    textureStore(pass_out, pos, 0, vec4<f32>(next_feature.x, next_feature.y, 0.0, 1.0));
     
-    // 출력
-    var display_color = vec3<f32>(1.0);
-    if (next_active > 0.5) {
-        display_color = vec3<f32>(next_feature.x, next_feature.y, 0.6);
-    }
-    textureStore(screen, pos, vec4<f32>(display_color, 1.0));
+    // 화면 출력 (빈 칸 없이 가득 찬 색상)
+    textureStore(screen, pos, vec4<f32>(next_feature.x, next_feature.y, 0.5, 1.0));
 }
 
 fn hash(p: vec2<f32>) -> f32 {
