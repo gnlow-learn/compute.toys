@@ -52,14 +52,10 @@ fn get_height(uv: vec2f) -> f32 {
     return pow(fbm_tiled(uv * world_scale, world_scale), 1.5);
 }
 
-fn sample_food(pos: vec2f, size: vec2u) -> f32 {
-    let coords = vec2i(fract(pos) * vec2f(size));
-    return textureLoad(pass_in, coords, 0, 0).y;
-}
-
-fn sample_height(pos: vec2f, size: vec2u) -> f32 {
-    let coords = vec2i(fract(pos) * vec2f(size));
-    return textureLoad(pass_in, coords, 0, 0).x;
+// 토러스 순환 샘플링 함수
+fn sample_buffer(uv: vec2f, size: vec2u) -> vec4f {
+    let coords = vec2i(fract(uv) * vec2f(size));
+    return textureLoad(pass_in, coords, 0, 0);
 }
 
 @compute @workgroup_size(16, 16)
@@ -69,27 +65,53 @@ fn main_compute(@builtin(global_invocation_id) id: vec3u) {
     let uv = vec2f(id.xy) / vec2f(size);
     let sea_level = 0.5;
     
+    // --- 1. 기본 지형 데이터 읽기 ---
     let h = get_height(uv);
-    var food = textureLoad(pass_in, pos_i, 0, 0).y;
-    let max_food = select(0.05, 1.0, h >= sea_level);
-    
-    if (time.frame == 0u) { food = max_food; }
-    else { food = min(food + 0.0005, max_food); }
+    let prev_data = textureLoad(pass_in, pos_i, 0, 0);
+    var food = prev_data.y;
+    var gene_map = prev_data.zw; // z, w 채널을 지역 유전 정보(평균 색상의 일부)로 활용
 
+    // --- 2. 초기화 (Frame 0) ---
+    if (time.frame == 0u) {
+        food = select(0.05, 1.0, h >= sea_level);
+        gene_map = pcg2d(id.xy); // 무작위 유전자 값으로 초기화
+    }
+
+    // --- 3. 유전자 확산 및 블러 (토러스 순환) ---
+    // 가우시안 블러 대용으로 인접 4픽셀과 믹스하여 서서히 번지게 함
+    let offset = 1.0 / vec2f(size);
+    let g_up = sample_buffer(uv + vec2f(0.0, offset.y), size).zw;
+    let g_down = sample_buffer(uv - vec2f(0.0, offset.y), size).zw;
+    let g_left = sample_buffer(uv - vec2f(offset.x, 0.0), size).zw;
+    let g_right = sample_buffer(uv + vec2f(offset.x, 0.0), size).zw;
+    gene_map = mix(gene_map, (g_up + g_down + g_left + g_right) * 0.25, 0.1);
+
+    // --- 4. 에이전트 상호작용 및 유전자 각인 ---
     let agent_count = 128u;
+    
+    // 식량 소비 로직
     for (var i = 0u; i < agent_count; i++) {
         if (agents[i].alive > 0.5) {
             let dist = distance(agents[i].pos * vec2f(size), vec2f(id.xy));
             let consume_radius = sqrt(agents[i].pop) * 2.4; 
             if (dist < consume_radius) {
-                let norm_dist = dist / consume_radius;
-                let falloff = 0.5 * (1.0 + cos(norm_dist * 3.14159)); 
-                let consumption_rate = falloff * agents[i].pop * 0.0004;
-                food *= clamp(1.0 - consumption_rate, 0.0, 1.0);
+                let falloff = 0.5 * (1.0 + cos((dist / consume_radius) * 3.14159)); 
+                food *= clamp(1.0 - (falloff * agents[i].pop * 0.0004), 0.0, 1.0);
             }
         }
     }
 
+    // [중요] 지역 유전자 업데이트: 한 프레임당 한 에이전트씩 해당 위치 유전자에 각인
+    let active_agent_idx = time.frame % agent_count;
+    let target_a = agents[active_agent_idx];
+    if (target_a.alive > 0.5) {
+        let dist_to_target = distance(target_a.pos * vec2f(size), vec2f(id.xy));
+        if (dist_to_target < 2.0) { // 에이전트 위치 주변 픽셀에 각인
+            gene_map = mix(gene_map, target_a.color.xy, 0.1); 
+        }
+    }
+
+    // --- 5. 에이전트 물리 및 생태 (기존 로직 유지) ---
     if (id.x == 0 && id.y == 0) {
         for (var i = 0u; i < agent_count; i++) {
             var a = agents[i];
@@ -98,64 +120,47 @@ fn main_compute(@builtin(global_invocation_id) id: vec3u) {
                 else { a.alive = 0.0; }
             } else if (a.alive > 0.5) {
                 let r_seed = pcg2d(vec2u(bitcast<u32>(a.pos.x * 1537.0), i) + vec2u(time.frame));
-                let cur_food = sample_food(a.pos, size);
-                let cur_h = sample_height(a.pos, size);
-                
-                // 1. 관성 감쇠 및 8방향 센서 기반 지형 반발/식량 유인력
-                var move_vec = vec2f(cos(a.dir), sin(a.dir)) * 1.75; // Decay 효과 포함
-                let sensor_dist = 0.025;
+                let cur_h = sample_buffer(a.pos, size).x;
                 let pref_h = 0.6;
+                let cur_food = sample_buffer(a.pos, size).y * (1.0 - clamp(abs(cur_h - pref_h) * 1.5, 0.0, 0.9));
                 
+                // 물리 및 이동
+                var move_vec = vec2f(cos(a.dir), sin(a.dir)) * 1.75; 
                 for (var d = 0.0; d < 8.0; d += 1.0) {
                     let angle = d * (6.28318 / 8.0);
-                    let s_pos = a.pos + vec2f(cos(angle), sin(angle)) * sensor_dist;
-                    let s_food = sample_food(s_pos, size);
-                    let s_h = sample_height(s_pos, size);
-                    move_vec += vec2f(cos(angle), sin(angle)) * s_food;
-                    let h_diff = abs(s_h - pref_h);
-                    move_vec -= vec2f(cos(angle), sin(angle)) * pow(h_diff, 2.0) * 1.5;
+                    let s_pos = a.pos + vec2f(cos(angle), sin(angle)) * 0.025;
+                    let s_data = sample_buffer(s_pos, size);
+                    move_vec += vec2f(cos(angle), sin(angle)) * s_data.y;
+                    move_vec -= vec2f(cos(angle), sin(angle)) * pow(abs(s_data.x - pref_h), 2.0) * 3.0;
                 }
 
-                // 2. 새로운 방향 및 속도
                 a.dir = atan2(move_vec.y, move_vec.x) + (r_seed.x - 0.5) * 0.05;
-                let weight_factor = mix(1.2, 0.3, clamp(a.pop / 150.0 + abs(cur_h - pref_h), 0.0, 1.0));
-                let base_speed = mix(0.00005, 0.0005, clamp(cur_h * 2.0, 0.1, 1.0));
-                let speed = base_speed * clamp(length(move_vec) * 1.5, 0.05, 2.5) * weight_factor;
+                let speed = mix(0.00005, 0.0005, clamp(cur_h * 2.0, 0.1, 1.0)) * clamp(length(move_vec) * 1.5, 0.05, 2.5) * mix(1.0, 0.2, clamp(a.pop / 200.0, 0.0, 1.0)) *
+                            mix(1.2, 0.4, clamp(abs(cur_h - pref_h) * 2.0, 0.0, 1.0));
                 a.pos = fract(a.pos + vec2f(cos(a.dir), sin(a.dir)) * speed);
 
-                // 3. 성장 및 쿨다운
+                // 성장, 돌연변이, 분열, 상호작용 등... (이전 로직 동일)
                 let demand = a.pop * 0.001;
-                if (cur_food > demand) { a.pop += (cur_food - demand) * 0.5; }
-                else { a.pop -= (demand - cur_food) * 10.0 + 0.05; }
+                if (cur_food > demand) { a.pop += (cur_food - demand) * 0.5; } else { a.pop -= (demand - cur_food) * 10.0 + 0.05; }
                 a.cooldown = max(a.cooldown - 1.0, 0.0);
-
-                // 4. 멱함수 분포 돌연변이 적용
                 if (r_seed.x < 0.1) {
-                    let rand3 = pcg3d(vec3u(i, time.frame, 88u));
-                    // 멱함수: rand^3을 적용하여 작은 값은 더 작게, 큰 값은 드물게 발생
-                    let power_rand = (rand3 - 0.5) * (rand3 - 0.5) * (rand3 - 0.5) * 8.0; 
-                    let mutation_strength = 0.3 / (sqrt(a.pop) + 1.0);
-                    a.color = clamp(a.color + power_rand * mutation_strength, vec3f(0.1), vec3f(1.0));
+                    let p_rand = (pcg3d(vec3u(i, time.frame, 88u)) - 0.5);
+                    a.color = clamp(a.color + p_rand * p_rand * p_rand * 8.0 * (0.3 / (sqrt(a.pop) + 1.0)), vec3f(0.1), vec3f(1.0));
                 }
-
-                // 5. 확률적 분열 (70:30)
-                let split_chance = clamp((a.pop - 100.0) * 0.01, 0.0, 0.5);
-                if (r_seed.y < split_chance) {
+                if (r_seed.y < clamp((a.pop - 100.0) * 0.01, 0.0, 0.5)) {
                     for (var j = 0u; j < 4u; j++) {
                         let c_idx = u32(pcg2d(vec2u(i, j + time.frame)).x * 128.0) % 128u;
                         if (agents[c_idx].alive < 0.5 && c_idx != i) {
-                            a.pop *= 0.7;
-                            a.cooldown = 100.0;
-                            agents[c_idx] = Agent(a.pos, a.color, 1.0, a.pop * 0.428, r_seed.x * 6.28, 100.0); // 70:30 비율 유지
+                            a.pop *= 0.7; a.cooldown = 100.0;
+                            agents[c_idx] = Agent(a.pos, a.color, 1.0, a.pop * 0.428, r_seed.x * 6.28, 100.0);
                             break;
                         }
                     }
                 }
-                
-                // 6. 병합
                 let other_idx = u32(r_seed.y * 128.0) % 128u;
-                if (other_idx != i && agents[other_idx].alive > 0.5 && a.cooldown <= 0.0 && agents[other_idx].cooldown <= 0.0) {
-                    if (distance(a.pos, agents[other_idx].pos) < 0.02) {
+                if (other_idx != i && agents[other_idx].alive > 0.5 && distance(a.pos, agents[other_idx].pos) < 0.02) {
+                    a.color = mix(a.color, agents[other_idx].color, 0.1);
+                    if (a.cooldown <= 0.0 && agents[other_idx].cooldown <= 0.0) {
                         let total_pop = a.pop + agents[other_idx].pop;
                         if (distance(a.color, agents[other_idx].color) < (0.8 / (total_pop * 0.01 + 1.0))) {
                             a.color = mix(a.color, agents[other_idx].color, agents[other_idx].pop / total_pop);
@@ -169,26 +174,30 @@ fn main_compute(@builtin(global_invocation_id) id: vec3u) {
         }
     }
 
-    // --- 렌더링 (입체감 강화 및 에이전트 크기 축소) ---
+    // --- 6. 렌더링 (지형 오버레이) ---
     var final_col: vec3f;
+    let local_gene_color = vec3f(gene_map, 0.5); // z, w를 R, G로 사용하고 B는 고정
+
     if (h < sea_level) {
-        let water_depth = h / sea_level;
-        final_col = mix(vec3f(0.01, 0.03, 0.1), vec3f(0.1, 0.3, 0.5), water_depth) + vec3f(0, 0.15, 0.05) * food;
+        final_col = mix(vec3f(0.01, 0.03, 0.1), vec3f(0.1, 0.3, 0.5), h / sea_level) + vec3f(0, 0.15, 0.05) * food;
     } else {
         let land_h = (h - sea_level) / (1.0 - sea_level);
         var land_base = mix(vec3f(0.1, 0.2, 0.1), vec3f(0.35, 0.3, 0.2), smoothstep(0.2, 0.7, land_h));
         land_base = mix(land_base, vec3f(0.9, 0.9, 1.0), smoothstep(0.75, 0.95, land_h));
-        let forest = vec3f(0.05, 0.4, 0.1) * food * (1.0 - smoothstep(0.6, 0.8, land_h));
+        
+        // [복구] 유전자 지도 오버레이: 육지 부분에만 유전자 지도 색상을 20% 믹스
+        land_base = mix(land_base, local_gene_color, 1);
+        
         let slope = get_height(uv + vec2f(0.002, 0.002)) - h;
-        final_col = (land_base + forest) * clamp(1.0 + slope * 30.0, 0.6, 1.4);
+        final_col = (land_base + vec3f(0.05, 0.4, 0.1) * food * (1.0 - smoothstep(0.6, 0.8, land_h))) * clamp(1.0 + slope * 30.0, 0.6, 1.4);
     }
 
+    // 에이전트 그리기
     let screen_pos = uv * vec2f(size);
     for (var i = 0u; i < 128u; i++) {
         if (agents[i].alive > 0.5) {
             let d = distance(agents[i].pos * vec2f(size), screen_pos);
-            // 에이전트 렌더링 크기 절반으로 축소
-            let r = sqrt(agents[i].pop) * 0.55 + 0.6;
+            let r = sqrt(agents[i].pop) * 0.55 + 0.6; 
             if (d < r) {
                 final_col = agents[i].color;
                 if (d > r * 0.8) { final_col *= 0.2; }
@@ -196,6 +205,8 @@ fn main_compute(@builtin(global_invocation_id) id: vec3u) {
             }
         }
     }
-    textureStore(pass_out, pos_i, 0, vec4f(h, food, 0.0, 1.0));
+    
+    food = min(food + 0.0005, select(0.05, 1.0, h >= sea_level));
+    textureStore(pass_out, pos_i, 0, vec4f(h, food, gene_map.x, gene_map.y));
     textureStore(screen, pos_i, vec4f(final_col, 1.0));
 }
