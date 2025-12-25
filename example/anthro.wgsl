@@ -101,42 +101,41 @@ fn main_compute(@builtin(global_invocation_id) id: vec3u) {
                 let cur_food = sample_food(a.pos, size);
                 let cur_h = sample_height(a.pos, size);
                 
-                // 1. 관성 감쇠(강화됨) 및 센서 벡터 합산
-                // Decay를 0.7로 강화하여 식량 경사가 없으면 더 빨리 멈춤
-                var move_vec = vec2f(cos(a.dir), sin(a.dir)) * 2.5 * 0.7; 
-                
+                // 1. 관성 감쇠 및 8방향 센서 기반 지형 반발/식량 유인력
+                var move_vec = vec2f(cos(a.dir), sin(a.dir)) * 1.75; // Decay 효과 포함
                 let sensor_dist = 0.025;
-                var sensor_sum = vec2f(0.0);
+                let pref_h = 0.6;
+                
                 for (var d = 0.0; d < 8.0; d += 1.0) {
                     let angle = d * (6.28318 / 8.0);
                     let s_pos = a.pos + vec2f(cos(angle), sin(angle)) * sensor_dist;
                     let s_food = sample_food(s_pos, size);
-                    sensor_sum += vec2f(cos(angle), sin(angle)) * s_food;
+                    let s_h = sample_height(s_pos, size);
+                    move_vec += vec2f(cos(angle), sin(angle)) * s_food;
+                    let h_diff = abs(s_h - pref_h);
+                    move_vec -= vec2f(cos(angle), sin(angle)) * pow(h_diff, 2.0) * 1.5;
                 }
-                move_vec += sensor_sum;
 
-                // 2. 방향 및 속도 결정
+                // 2. 새로운 방향 및 속도
                 a.dir = atan2(move_vec.y, move_vec.x) + (r_seed.x - 0.5) * 0.05;
-                
-                let weight_factor = mix(1.2, 0.3, clamp(a.pop / 150.0, 0.0, 1.0));
+                let weight_factor = mix(1.2, 0.3, clamp(a.pop / 150.0 + abs(cur_h - pref_h), 0.0, 1.0));
                 let base_speed = mix(0.00005, 0.0005, clamp(cur_h * 2.0, 0.1, 1.0));
                 let speed = base_speed * clamp(length(move_vec) * 1.5, 0.05, 2.5) * weight_factor;
-
                 a.pos = fract(a.pos + vec2f(cos(a.dir), sin(a.dir)) * speed);
 
-                // 3. 인구 성장 및 섭취
+                // 3. 성장 및 쿨다운
                 let demand = a.pop * 0.001;
                 if (cur_food > demand) { a.pop += (cur_food - demand) * 0.5; }
                 else { a.pop -= (demand - cur_food) * 10.0 + 0.05; }
-                
                 a.cooldown = max(a.cooldown - 1.0, 0.0);
 
-                // 4. 돌연변이 로직 복구 (일정 시간마다 확률적 전이)
+                // 4. 멱함수 분포 돌연변이 적용
                 if (r_seed.x < 0.1) {
-                    // 인구가 많을수록 변이 폭이 좁아지도록 설계 (안정성)
-                    let mutation_strength = 0.2 / (sqrt(a.pop) + 1.0);
-                    let color_mut = pcg3d(vec3u(i, time.frame, 77u)) - 0.5;
-                    a.color = clamp(a.color + color_mut * mutation_strength, vec3f(0.1), vec3f(1.0));
+                    let rand3 = pcg3d(vec3u(i, time.frame, 88u));
+                    // 멱함수: rand^3을 적용하여 작은 값은 더 작게, 큰 값은 드물게 발생
+                    let power_rand = (rand3 - 0.5) * (rand3 - 0.5) * (rand3 - 0.5) * 8.0; 
+                    let mutation_strength = 0.3 / (sqrt(a.pop) + 1.0);
+                    a.color = clamp(a.color + power_rand * mutation_strength, vec3f(0.1), vec3f(1.0));
                 }
 
                 // 5. 확률적 분열 (70:30)
@@ -145,16 +144,15 @@ fn main_compute(@builtin(global_invocation_id) id: vec3u) {
                     for (var j = 0u; j < 4u; j++) {
                         let c_idx = u32(pcg2d(vec2u(i, j + time.frame)).x * 128.0) % 128u;
                         if (agents[c_idx].alive < 0.5 && c_idx != i) {
-                            let child_pop = a.pop * 0.3;
                             a.pop *= 0.7;
                             a.cooldown = 100.0;
-                            agents[c_idx] = Agent(a.pos, a.color, 1.0, child_pop, r_seed.x * 6.28, 100.0);
+                            agents[c_idx] = Agent(a.pos, a.color, 1.0, a.pop * 0.428, r_seed.x * 6.28, 100.0); // 70:30 비율 유지
                             break;
                         }
                     }
                 }
                 
-                // 6. 조건부 병합
+                // 6. 병합
                 let other_idx = u32(r_seed.y * 128.0) % 128u;
                 if (other_idx != i && agents[other_idx].alive > 0.5 && a.cooldown <= 0.0 && agents[other_idx].cooldown <= 0.0) {
                     if (distance(a.pos, agents[other_idx].pos) < 0.02) {
@@ -171,19 +169,26 @@ fn main_compute(@builtin(global_invocation_id) id: vec3u) {
         }
     }
 
-    // --- 렌더링 ---
+    // --- 렌더링 (입체감 강화 및 에이전트 크기 축소) ---
     var final_col: vec3f;
     if (h < sea_level) {
-        final_col = mix(vec3f(0.02, 0.05, 0.1), vec3f(0.1, 0.2, 0.3), h / sea_level) + vec3f(0, 0.15, 0.05) * food;
+        let water_depth = h / sea_level;
+        final_col = mix(vec3f(0.01, 0.03, 0.1), vec3f(0.1, 0.3, 0.5), water_depth) + vec3f(0, 0.15, 0.05) * food;
     } else {
-        final_col = mix(vec3f(0.2, 0.15, 0.1), vec3f(0.4, 0.4, 0.3), (h - sea_level) * 2.0) + vec3f(0.02, 0.4, 0.08) * food;
+        let land_h = (h - sea_level) / (1.0 - sea_level);
+        var land_base = mix(vec3f(0.1, 0.2, 0.1), vec3f(0.35, 0.3, 0.2), smoothstep(0.2, 0.7, land_h));
+        land_base = mix(land_base, vec3f(0.9, 0.9, 1.0), smoothstep(0.75, 0.95, land_h));
+        let forest = vec3f(0.05, 0.4, 0.1) * food * (1.0 - smoothstep(0.6, 0.8, land_h));
+        let slope = get_height(uv + vec2f(0.002, 0.002)) - h;
+        final_col = (land_base + forest) * clamp(1.0 + slope * 30.0, 0.6, 1.4);
     }
 
     let screen_pos = uv * vec2f(size);
     for (var i = 0u; i < 128u; i++) {
         if (agents[i].alive > 0.5) {
             let d = distance(agents[i].pos * vec2f(size), screen_pos);
-            let r = sqrt(agents[i].pop) * 1.1 + 1.2;
+            // 에이전트 렌더링 크기 절반으로 축소
+            let r = sqrt(agents[i].pop) * 0.55 + 0.6;
             if (d < r) {
                 final_col = agents[i].color;
                 if (d > r * 0.8) { final_col *= 0.2; }
