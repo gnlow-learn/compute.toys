@@ -144,8 +144,24 @@ fn main_compute(@builtin(global_invocation_id) id: vec3u) {
                     for (var j = 0u; j < 4u; j++) {
                         let c_idx = u32(pcg2d(vec2u(i, j + time.frame)).x * f32(agent_count)) % agent_count;
                         if (agents[c_idx].alive < 0.5 && c_idx != i) {
-                            a.pop *= 0.45;
-                            agents[c_idx] = Agent(a.pos, a.color, 1.0, a.pop, a.dir + 3.14);
+                            // 1. 부모의 인구 절반을 나눔
+                            a.pop *= 0.5; 
+                            
+                            // 2. 자식 개체 생성
+                            // - 위치: 부모와 동일
+                            // - 색상: 부모와 동일
+                            // - 관성 초기화: 자식의 방향(dir)을 무작위로 설정하여 특정 추진력을 없앰
+                            let random_angle = pcg2d(vec2u(c_idx, time.frame)).x * 6.28318;
+                            
+                            agents[c_idx] = Agent(
+                                a.pos,          // 위치 유지
+                                a.color,        // 색상 유지
+                                1.0,            // alive 설정
+                                a.pop,          // 나눈 인구 할당
+                                random_angle    // 방향을 랜덤으로 설정 (기존 a.dir + 3.14 제거)
+                            );
+                            
+                            // 부모는 기존 a.dir을 유지하므로 가던 길을 계속 감 (관성 유지)
                             break;
                         }
                     }
