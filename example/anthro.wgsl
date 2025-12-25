@@ -8,7 +8,7 @@ struct Agent {
 
 #storage agents array<Agent, 1024>
 
-// --- 해시 및 지형 함수 (원상 복귀) ---
+// --- 해시 및 지형 함수 ---
 fn pcg2d(p: vec2u) -> vec2f {
     var v = p * 1664525u + 1013904223u;
     v.x += v.y * 1664525u; v.y += v.x * 1664525u;
@@ -61,10 +61,9 @@ fn sample_food(pos: vec2f, size: vec2u) -> f32 {
 
 fn sample_height(pos: vec2f, size: vec2u) -> f32 {
     let coords = vec2i(fract(pos) * vec2f(size));
-    return textureLoad(pass_in, coords, 0, 0).x; // x 채널에 h가 저장되어 있음
+    return textureLoad(pass_in, coords, 0, 0).x;
 }
 
-// --- 메인 시뮬레이션 ---
 @compute @workgroup_size(16, 16)
 fn main_compute(@builtin(global_invocation_id) id: vec3u) {
     let size = textureDimensions(screen);
@@ -72,12 +71,11 @@ fn main_compute(@builtin(global_invocation_id) id: vec3u) {
     let uv = vec2f(id.xy) / vec2f(size);
     let sea_level = 0.5;
     
-    // 1. 지형 및 식량 재생
     let h = get_height(uv);
     var food = textureLoad(pass_in, pos_i, 0, 0).y;
     
-    // [수정] 바다 식량 로직: 육지는 1.0까지, 바다는 0.1까지 재생
-    let max_food = select(0.1, 1.0, h >= sea_level);
+    // 바다 식량 상한을 0.1에서 0.05로 수정
+    let max_food = select(0.05, 1.0, h >= sea_level);
     food = min(food + 0.0005, max_food);
 
     let agent_count = 1024u;
@@ -92,7 +90,6 @@ fn main_compute(@builtin(global_invocation_id) id: vec3u) {
         }
     }
 
-    // 2. 에이전트 업데이트 (중앙 스레드 격리)
     if (id.x == 0 && id.y == 0) {
         for (var i = 0u; i < agent_count; i++) {
             var a = agents[i];
@@ -108,67 +105,51 @@ fn main_compute(@builtin(global_invocation_id) id: vec3u) {
                 let cur_h = sample_height(a.pos, size);
                 let demand = a.pop * 0.001;
 
-                // [수정] 이동 속도 페널티: 육지(0.0005) -> 심해(0.00005)까지 h에 비례
-                // 얕은 물일수록 h가 0.5에 가깝고, 심해일수록 0에 가깝습니다.
-                let speed = mix(0.00005, 0.0005, clamp(cur_h * 2.0, 0.1, 1.0));
+                // 인구 비례 속도: 50명 기준 (많으면 느려짐, 적으면 빨라짐)
+                let base_speed = mix(0.00005, 0.0005, clamp(cur_h * 2.0, 0.1, 1.0));
+                let speed = base_speed * (50.0 / a.pop);
 
-                // 바다 회피 (식량 기반)
                 let sensor_dist = 0.015;
                 let sensor_angle = 0.65;
-                let f_left  = sample_food(a.pos + vec2f(cos(a.dir - sensor_angle), sin(a.dir - sensor_angle)) * sensor_dist, size);
-                let f_front = sample_food(a.pos + vec2f(cos(a.dir), sin(a.dir)) * sensor_dist, size);
-                let f_right = sample_food(a.pos + vec2f(cos(a.dir + sensor_angle), sin(a.dir + sensor_angle)) * sensor_dist, size);
+                let f_left   = sample_food(a.pos + vec2f(cos(a.dir - sensor_angle), sin(a.dir - sensor_angle)) * sensor_dist, size);
+                let f_front  = sample_food(a.pos + vec2f(cos(a.dir), sin(a.dir)) * sensor_dist, size);
+                let f_right  = sample_food(a.pos + vec2f(cos(a.dir + sensor_angle), sin(a.dir + sensor_angle)) * sensor_dist, size);
                 
-                // 식량이 0.1 근처(바다)라면 기피하되, 배고프면(cur_food < demand) 무시
                 if (f_front <= 0.15 && cur_food >= demand) {
                     a.dir += 0.15;
                 }
 
                 if (f_left > f_front && f_left > f_right) { a.dir -= 0.05; }
                 else if (f_right > f_front && f_right > f_left) { a.dir += 0.05; }
-                a.dir += (r_seed.x - 0.5) * 0.02;
+                
+                // 인구 비례 회전각: 50명 기준 (많으면 제자리 흔들림 증가, 적으면 직진성 강화)
+                a.dir += (r_seed.x - 0.5) * 0.02 * (a.pop / 50.0);
 
                 a.pos = fract(a.pos + vec2f(cos(a.dir), sin(a.dir)) * speed);
 
-                // 인구 변화
                 if (cur_food > demand) { 
                     a.pop += (cur_food - demand) * 0.4; 
                 } else { 
-                    // 깊은 바다일수록 더 치명적인 생존 페널티
                     let starv_rate = mix(20.0, 5.0, clamp(cur_h * 2.0, 0.0, 1.0));
                     a.pop -= (demand - cur_food) * starv_rate + 0.05; 
                 }
 
-                // 분열 및 합병
                 if (a.pop > 100.0) {
                     for (var j = 0u; j < 4u; j++) {
                         let c_idx = u32(pcg2d(vec2u(i, j + time.frame)).x * f32(agent_count)) % agent_count;
                         if (agents[c_idx].alive < 0.5 && c_idx != i) {
-                            // 1. 부모의 인구 절반을 나눔
-                            a.pop *= 0.5; 
-                            
-                            // 2. 자식 개체 생성
-                            // - 위치: 부모와 동일
-                            // - 색상: 부모와 동일
-                            // - 관성 초기화: 자식의 방향(dir)을 무작위로 설정하여 특정 추진력을 없앰
+                            a.pop *= 0.5;
                             let random_angle = pcg2d(vec2u(c_idx, time.frame)).x * 6.28318;
-                            
-                            agents[c_idx] = Agent(
-                                a.pos,          // 위치 유지
-                                a.color,        // 색상 유지
-                                1.0,            // alive 설정
-                                a.pop,          // 나눈 인구 할당
-                                random_angle    // 방향을 랜덤으로 설정 (기존 a.dir + 3.14 제거)
-                            );
-                            
-                            // 부모는 기존 a.dir을 유지하므로 가던 길을 계속 감 (관성 유지)
+                            agents[c_idx] = Agent(a.pos, a.color, 1.0, a.pop, random_angle);
                             break;
                         }
                     }
                 }
                 
-                // 돌연변이 & 합병 (생략 방지)
-                if (r_seed.x < 0.02) { a.color = clamp(a.color + (pcg3d(vec3u(i, time.frame, 99u)) - 0.5) * (0.2 / (sqrt(a.pop) + 1.0)), vec3f(0.1), vec3f(1.0)); }
+                if (r_seed.x < 0.1) { 
+                    a.color = clamp(a.color + (pcg3d(vec3u(i, time.frame, 99u)) - 0.5) * (0.2 / (sqrt(a.pop) + 1.0)), vec3f(0.1), vec3f(1.0)); 
+                }
+
                 let other_idx = u32(r_seed.y * f32(agent_count)) % agent_count;
                 if (other_idx != i && agents[other_idx].alive > 0.5) {
                     let other = agents[other_idx];
@@ -186,10 +167,8 @@ fn main_compute(@builtin(global_invocation_id) id: vec3u) {
         }
     }
 
-    // --- 3. 렌더링 ---
     var final_col: vec3f;
     if (h < sea_level) {
-        // 식량이 0.1 있으므로 바다에서도 약간의 초록빛(플랑크톤 같은 느낌)이 돕니다.
         let water = mix(vec3f(0.02, 0.05, 0.1), vec3f(0.1, 0.2, 0.3), h / sea_level);
         final_col = water + vec3f(0.0, 0.15, 0.05) * food;
     } else {
